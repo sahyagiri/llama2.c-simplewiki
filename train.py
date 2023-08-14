@@ -24,11 +24,13 @@ from datetime import datetime
 from functools import partial
 
 import torch
-from model import Transformer, ModelArgs
+from model import Transformer, ModelArgs, apply_lora, merge_lora, tie_lora_weights
 from torch.distributed import destroy_process_group, init_process_group
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from tinystories import Task
+from tinyshakespeare import ShakespeareTask
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -38,7 +40,7 @@ log_interval = 1
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
-init_from = "scratch"  # 'scratch' or 'resume'
+init_from = "scratch"  # 'scratch' or 'resume' or 'lora_finetune'
 # wandb logging
 wandb_log = False  # disabled by default
 wandb_project = "llamac"
@@ -46,15 +48,19 @@ wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
 batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 256
-vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
-vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
+dataset = "tinystories"  # tinystories|tinyshakespeare
 # model
 dim = 288
 n_layers = 6
 n_heads = 6
-n_kv_heads = 6
 multiple_of = 32
 dropout = 0.0
+# LoRA
+lora_layer_types = [nn.Linear, nn.Embedding]
+lora_rank = 4
+lora_dropout = 0.1
+lora_alpha = 1.0
+lora_tie_embedding_weights = True
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -83,10 +89,6 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
 min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-
-# validating checks
-assert vocab_source in ["llama2", "custom"]
-assert vocab_source == "custom" or vocab_size == 32000, "The vocab from Meta has 32K tokens"
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
@@ -128,12 +130,11 @@ ctx = (
 )
 
 # task-specific setup
+task = {'tinystories': Task, 'tinyshakespeare': ShakespeareTask}[dataset]
 iter_batches = partial(
-    Task.iter_batches,
+    task.iter_batches,
     batch_size=batch_size,
     max_seq_len=max_seq_len,
-    vocab_size=vocab_size,
-    vocab_source=vocab_source,
     device=device,
     num_workers=0,
 )
@@ -147,8 +148,8 @@ model_args = dict(
     dim=dim,
     n_layers=n_layers,
     n_heads=n_heads,
-    n_kv_heads=n_kv_heads,
-    vocab_size=vocab_size,
+    n_kv_heads=n_heads,
+    vocab_size=32000,
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
@@ -158,7 +159,7 @@ if init_from == "scratch":
     print("Initializing a new model from scratch")
     gptconf = ModelArgs(**model_args)
     model = Transformer(gptconf)
-elif init_from == "resume":
+elif init_from in ("resume", "lora_finetune"):
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
@@ -179,8 +180,19 @@ elif init_from == "resume":
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    iter_num = checkpoint["iter_num"]
-    best_val_loss = checkpoint["best_val_loss"]
+    if init_from == 'resume':
+        iter_num = checkpoint["iter_num"]
+        best_val_loss = checkpoint["best_val_loss"]
+
+if init_from == "lora_finetune":
+    out_dir = out_dir + "_lora_finetune"
+    os.makedirs(out_dir, exist_ok=True)
+    for p in model.parameters():
+        p.requires_grad = False
+    apply_lora(model, layer_types=lora_layer_types, rank=lora_rank, dropout=lora_dropout, alpha=lora_alpha)
+    if lora_tie_embedding_weights:
+        tie_lora_weights(model.output, model.tok_embeddings)
+
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -212,13 +224,13 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ["train", "val"]:
-        batch_iter = iter_batches(split=split)
+        batch_iter = iter_batches(split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
             X, Y = next(batch_iter)
             with ctx:
                 logits = model(X, Y)
-                loss = raw_model.last_loss
+                loss = model.last_loss
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -244,7 +256,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-train_batch_iter = iter_batches(split="train")
+train_batch_iter = iter_batches("train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
@@ -302,7 +314,7 @@ while True:
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
             logits = model(X, Y)
-            loss = raw_model.last_loss
+            loss = model.last_loss
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = next(train_batch_iter)
@@ -337,6 +349,13 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+if init_from == "lora_finetune":
+    print('merging lora')
+    merge_lora(raw_model)
+    print('saving merged lora model checkpoint')
+    raw_model.export(os.path.join(out_dir, "model_lora_merged.bin"))
+
 
 if ddp:
     destroy_process_group()
